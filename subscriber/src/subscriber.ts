@@ -16,7 +16,11 @@ let pendingCandidates: unknown[] = [];
 
 // ---- WebSocket URL ----
 const wsParam = new URLSearchParams(location.search).get('ws');
-const WS_URL = wsParam || 'ws://192.168.50.107:8080';
+const WS_URL =
+  (location.protocol === "https:" ? "wss://" : "ws://") +
+  location.host +
+  "/ws";
+
 log('WS_URL =', WS_URL);
 
 // ---- WebSocket setup ----
