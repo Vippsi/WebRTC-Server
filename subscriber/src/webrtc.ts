@@ -5,7 +5,7 @@ import { getVideo, log, normalizeIce } from './utils';
 import type { CandidateMsg } from './types';
 
 const turnUsername = import.meta.env.VITE_TURN_USERNAME ?? 'webrtcuser';
-const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL ?? '';
+const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL ?? 'REPLACE_WITH_STRONG_PASSWORD';
 
 export async function addIceToPC(
   targetPC: RTCPeerConnection,
@@ -26,12 +26,9 @@ export async function addIceToPC(
 export function makePC(socket: WebSocket): RTCPeerConnection {
   const next = new RTCPeerConnection({
     iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: ['stun:stun.l.google.com:19302'] },
       {
-        urls: [
-          'turn:turn.vippsi.dev:3478?transport=udp',
-          'turn:turn.vippsi.dev:3478?transport=tcp',
-        ],
+        urls: ['turn:turn.vippsi.dev:3478?transport=udp'],
         username: turnUsername,
         credential: turnCredential,
       },
