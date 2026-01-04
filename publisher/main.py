@@ -1,17 +1,5 @@
 # WebRTC publisher + control
 # publisher/main.py
-#
-# Phase A: control-only smoke test
-# - Connect to WS signaling server
-# - Identify as publisher
-# - Receive control messages
-# - Send Roku ECP commands (via roku.py)
-#
-# Run:
-#   python -m publisher.main --signaling ws://YOUR_SIGNALING_HOST:8080 --roku-ip 192.168.1.50
-#
-# Example local:
-#   python -m publisher.main --signaling ws://localhost:8080 --roku-ip 192.168.1.50
 
 from __future__ import annotations
 
@@ -75,7 +63,9 @@ async def publisher_loop(signaling_url: str, roku_ip: str, roku_port: int) -> No
     while True:
         try:
             print(f"[publisher] connecting to signaling: {signaling_url}")
-            async with websockets.connect(signaling_url, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(
+                signaling_url, ping_interval=20, ping_timeout=20
+            ) as ws:
                 # Register as publisher (matches your server.js)
                 await send_json(ws, {"type": "hello", "role": "publisher"})
                 print("[publisher] sent hello as publisher")
@@ -103,11 +93,15 @@ async def publisher_loop(signaling_url: str, roku_ip: str, roku_port: int) -> No
                         try:
                             result = await handle_control(roku, payload)
                             # Optional ack back to subscriber for debugging
-                            await send_json(ws, {"type": "control-status", "payload": result})
+                            await send_json(
+                                ws, {"type": "control-status", "payload": result}
+                            )
                             print(f"[publisher] control ok: {result}")
                         except Exception as e:
                             err = {"ok": False, "error": str(e), "payload": payload}
-                            await send_json(ws, {"type": "control-status", "payload": err})
+                            await send_json(
+                                ws, {"type": "control-status", "payload": err}
+                            )
                             print(f"[publisher] control error: {err}")
                         continue
 
@@ -121,10 +115,14 @@ async def publisher_loop(signaling_url: str, roku_ip: str, roku_port: int) -> No
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Publisher (control-only) for Roku via signaling WS")
+    p = argparse.ArgumentParser(
+        description="Publisher (control-only) for Roku via signaling WS"
+    )
     p.add_argument("--signaling", required=True, help="ws://host:8080")
     p.add_argument("--roku-ip", required=True, help="Roku LAN IP (e.g. 192.168.1.50)")
-    p.add_argument("--roku-port", type=int, default=8060, help="Roku ECP port (default 8060)")
+    p.add_argument(
+        "--roku-port", type=int, default=8060, help="Roku ECP port (default 8060)"
+    )
     return p.parse_args(argv)
 
 

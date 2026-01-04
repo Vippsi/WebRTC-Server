@@ -6,7 +6,7 @@
 # - (optional) POST /launch/<appId>
 #
 # Usage:
-#   from roku import RokuECP
+#   from publisher.roku import RokuECP
 #   roku = RokuECP("192.168.1.50")
 #   await roku.key("HOME")
 #   await roku.text("netflix")
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import aiohttp
 
 
-# Generic -> Roku ECP mapping (what you asked for)
+# Generic -> Roku ECP mapping
 GENERIC_TO_ROKU_KEY = {
     "UP": "Up",
     "DOWN": "Down",
@@ -30,6 +30,9 @@ GENERIC_TO_ROKU_KEY = {
     "ENTER": "Select",
     "BACK": "Back",
     "HOME": "Home",
+    # Roku "Play" typically toggles play/pause on most devices
+    "PLAY": "Play",
+    "PAUSE": "Play",
     "PLAY_PAUSE": "Play",
 }
 
@@ -44,6 +47,7 @@ class RokuECP:
       - Endpoints accept POST with an empty body.
       - Key presses are stateless; no key-down/up needed.
     """
+
     ip: str
     port: int = 8060
     timeout_s: float = 3.0
@@ -54,10 +58,12 @@ class RokuECP:
     def base_url(self) -> str:
         return f"http://{self.ip}:{self.port}"
 
-    async def key(self, generic_key: str, session: aiohttp.ClientSession | None = None) -> None:
+    async def key(
+        self, generic_key: str, session: aiohttp.ClientSession | None = None
+    ) -> None:
         """
         Send a single keypress using a generic key name:
-          UP, DOWN, LEFT, RIGHT, ENTER, BACK, HOME, PLAY_PAUSE
+          UP, DOWN, LEFT, RIGHT, ENTER, BACK, HOME, PLAY/PAUSE/PLAY_PAUSE
         """
         if not generic_key:
             raise ValueError("generic_key is required")
@@ -71,18 +77,25 @@ class RokuECP:
 
         await self._post(f"/keypress/{roku_key}", session=session)
 
-    async def roku_keypress(self, roku_key: str, session: aiohttp.ClientSession | None = None) -> None:
+    async def roku_keypress(
+        self, roku_key: str, session: aiohttp.ClientSession | None = None
+    ) -> None:
         """
-        Send a raw Roku keypress (if you want to bypass generic mapping).
+        Send a raw Roku keypress (bypass generic mapping).
         Example: roku_keypress("InstantReplay")
         """
         if not roku_key:
             raise ValueError("roku_key is required")
         await self._post(f"/keypress/{roku_key}", session=session)
 
-    async def text(self, text: str, session: aiohttp.ClientSession | None = None, per_char_delay_s: float = 0.02) -> None:
+    async def text(
+        self,
+        text: str,
+        session: aiohttp.ClientSession | None = None,
+        per_char_delay_s: float = 0.02,
+    ) -> None:
         """
-        Type text by sending Lit_<char> keypresses. This is the simplest approach.
+        Type text by sending Lit_<char> keypresses.
 
         Roku expects each character via:
           POST /keypress/Lit_<url-encoded-char>
@@ -99,7 +112,6 @@ class RokuECP:
 
         try:
             for ch in text:
-                # Encode the character as a URL-safe token for Lit_
                 encoded = urllib.parse.quote(ch, safe="")
                 await self._post(f"/keypress/Lit_{encoded}", session=session)
                 if per_char_delay_s > 0:
@@ -108,7 +120,9 @@ class RokuECP:
             if owns_session and session:
                 await session.close()
 
-    async def launch(self, app_id: str, session: aiohttp.ClientSession | None = None) -> None:
+    async def launch(
+        self, app_id: str, session: aiohttp.ClientSession | None = None
+    ) -> None:
         """
         Launch a Roku channel by appId:
           POST /launch/<appId>
@@ -118,9 +132,14 @@ class RokuECP:
         app_id_enc = urllib.parse.quote(str(app_id), safe="")
         await self._post(f"/launch/{app_id_enc}", session=session)
 
-    async def _post(self, path: str, session: aiohttp.ClientSession | None = None) -> None:
+    async def _post(
+        self, path: str, session: aiohttp.ClientSession | None = None
+    ) -> None:
         """
         Internal POST helper with retries.
+
+        Retries on network-ish errors (timeouts, connection reset, etc).
+        Does NOT retry on non-2xx HTTP responses.
         """
         url = self.base_url + path
 
@@ -130,23 +149,23 @@ class RokuECP:
             session = aiohttp.ClientSession(timeout=timeout)
 
         try:
-            last_exc: Exception | None = None
             for attempt in range(self.retries + 1):
                 try:
                     async with session.post(url, data=b"") as resp:
-                        # Roku typically returns 200 OK; some endpoints may return 204
                         if resp.status < 200 or resp.status >= 300:
                             body = await resp.text()
-                            raise RuntimeError(f"Roku ECP POST {path} failed: {resp.status} {body[:200]}")
+                            raise RuntimeError(
+                                f"Roku ECP POST {path} failed: {resp.status} {body[:200]}"
+                            )
                         return
-                except Exception as e:
-                    last_exc = e
+                except RuntimeError:
+                    # Don't retry non-2xx responses
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     if attempt < self.retries:
-                        await asyncio.sleep(self.retry_backoff_s * (2 ** attempt))
+                        await asyncio.sleep(self.retry_backoff_s * (2**attempt))
                     else:
                         raise
-            if last_exc:
-                raise last_exc
         finally:
             if owns_session and session:
                 await session.close()
@@ -161,8 +180,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Minimal Roku ECP client")
     parser.add_argument("--ip", required=True, help="Roku IP address (LAN)")
-    parser.add_argument("--port", type=int, default=8060, help="Roku ECP port (default: 8060)")
-    parser.add_argument("--key", help="Generic key: UP/DOWN/LEFT/RIGHT/ENTER/BACK/HOME/PLAY_PAUSE")
+    parser.add_argument(
+        "--port", type=int, default=8060, help="Roku ECP port (default: 8060)"
+    )
+    parser.add_argument(
+        "--key",
+        help="Generic key: UP/DOWN/LEFT/RIGHT/ENTER/BACK/HOME/PLAY/PAUSE/PLAY_PAUSE",
+    )
     parser.add_argument("--text", help="Text to type using Lit_ keypresses")
     parser.add_argument("--launch", help="App ID to launch (optional)")
     args = parser.parse_args()

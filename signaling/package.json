@@ -3,9 +3,18 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.3"
   },
   "scripts": {
-    "start": "node server.js"
+    "dev": "tsx server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }
