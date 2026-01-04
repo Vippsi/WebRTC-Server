@@ -38,29 +38,20 @@ def sdp_from_text(sdp_text: str) -> GstSdp.SDPMessage:
     return msg
 
 
-def build_pipeline(
+def build_source_pipeline(
     video_dev: str,
     video_size: str,
     fps: int,
     audio_dev: Optional[str],
-) -> Gst.Pipeline:
+) -> tuple[Gst.Pipeline, Gst.Element, Optional[Gst.Element]]:
+    """
+    Build a single source pipeline with tee elements for video (and optionally audio).
+    Returns (pipeline, video_tee, audio_tee)
+    """
     w, h = video_size.split("x")
 
-    audio_branch = ""
-    if audio_dev:
-        audio_branch = f"""
-          alsasrc device={audio_dev} !
-            queue !
-            audioconvert ! audioresample !
-            opusenc bitrate=64000 !
-            rtpopuspay pt=111 !
-            application/x-rtp,media=audio,encoding-name=OPUS,payload=111 !
-            webrtc.
-        """
-
-    desc = f"""
-      webrtcbin name=webrtc bundle-policy=max-bundle stun-server={STUN_SERVER}
-
+    # Build video source -> tee
+    video_desc = f"""
       v4l2src device={video_dev} !
         image/jpeg,width={w},height={h},framerate={fps}/1 !
         queue !
@@ -71,66 +62,133 @@ def build_pipeline(
         video/x-h264,profile=baseline !
         rtph264pay config-interval=1 pt=96 !
         application/x-rtp,media=video,encoding-name=H264,payload=96 !
-        webrtc.
-
-      {audio_branch}
+        tee name=video_tee
     """
-    return Gst.parse_launch(desc)
+
+    audio_tee = None
+    if audio_dev:
+        audio_desc = f"""
+          alsasrc device={audio_dev} !
+            queue !
+            audioconvert ! audioresample !
+            opusenc bitrate=64000 !
+            rtpopuspay pt=111 !
+            application/x-rtp,media=audio,encoding-name=OPUS,payload=111 !
+            tee name=audio_tee
+        """
+        desc = video_desc + "\n      " + audio_desc
+    else:
+        desc = video_desc
+
+    pipeline = Gst.parse_launch(desc)
+    video_tee_elem = pipeline.get_by_name("video_tee")
+    assert video_tee_elem is not None
+
+    if audio_dev:
+        audio_tee_elem = pipeline.get_by_name("audio_tee")
+        assert audio_tee_elem is not None
+        audio_tee = audio_tee_elem
+
+    return (pipeline, video_tee_elem, audio_tee)
 
 
 class SubscriberConnection:
     """
-    Manages a single subscriber's WebRTC connection (pipeline + webrtcbin)
+    Manages a single subscriber's WebRTC connection (webrtcbin connected to shared source)
     """
 
     def __init__(
         self,
         subscriber_id: str,
-        video_device: str,
-        video_size: str,
-        framerate: int,
-        audio_device: Optional[str],
+        source_pipeline: Gst.Pipeline,
+        video_tee: Gst.Element,
+        audio_tee: Optional[Gst.Element],
         aio_loop: asyncio.AbstractEventLoop,
         ws,
     ) -> None:
         self.subscriber_id = subscriber_id
-        self.video_device = video_device
-        self.video_size = video_size
-        self.framerate = framerate
-        self.audio_device = audio_device
+        self._source_pipeline = source_pipeline
+        self._video_tee = video_tee
+        self._audio_tee = audio_tee
         self._aio_loop = aio_loop
         self._ws = ws
 
-        self._pipeline: Optional[Gst.Pipeline] = None
         self._webrtc: Optional[Gst.Element] = None
+        self._video_queue: Optional[Gst.Element] = None
+        self._audio_queue: Optional[Gst.Element] = None
+        self._video_tee_src_pad: Optional[Gst.Pad] = None
+        self._audio_tee_src_pad: Optional[Gst.Pad] = None
         self._making_offer = False
         self._have_remote_answer = False
 
     def start(self) -> None:
-        """Start the pipeline for this subscriber"""
-        # Build + start pipeline
-        self._pipeline = build_pipeline(
-            self.video_device, self.video_size, self.framerate, self.audio_device
+        """Create webrtcbin and connect it to the shared source tee"""
+        # Create webrtcbin
+        self._webrtc = Gst.ElementFactory.make(
+            "webrtcbin", f"webrtc_{self.subscriber_id}"
         )
-        webrtc = self._pipeline.get_by_name("webrtc")
-        assert webrtc is not None
-        self._webrtc = webrtc
+        if not self._webrtc:
+            print(f"[gst-{self.subscriber_id}] failed to create webrtcbin")
+            return
 
-        # Drain bus + log errors/warnings
-        bus = self._pipeline.get_bus()
-        if bus:
-            bus.add_signal_watch()
+        self._webrtc.set_property("bundle-policy", 1)  # max-bundle
+        self._webrtc.set_property("stun-server", STUN_SERVER)
 
-            def on_bus_message(_bus, message):
-                t = message.type
-                if t == Gst.MessageType.ERROR:
-                    err, dbg = message.parse_error()
-                    print(f"[gst-{self.subscriber_id}] ERROR:", err, dbg)
-                elif t == Gst.MessageType.WARNING:
-                    err, dbg = message.parse_warning()
-                    print(f"[gst-{self.subscriber_id}] WARNING:", err, dbg)
+        # Add webrtcbin to source pipeline
+        self._source_pipeline.add(self._webrtc)
 
-            bus.connect("message", on_bus_message)
+        # Create queue for video RTP stream
+        video_queue = Gst.ElementFactory.make(
+            "queue", f"video_queue_{self.subscriber_id}"
+        )
+        self._source_pipeline.add(video_queue)
+
+        # Request src pad from video tee and link to queue
+        self._video_tee_src_pad = self._video_tee.get_request_pad("src_%u")
+        video_queue_sink = video_queue.get_static_pad("sink")
+        if self._video_tee_src_pad.link(video_queue_sink) != Gst.PadLinkReturn.OK:
+            print(f"[gst-{self.subscriber_id}] failed to link video tee to queue")
+            return
+
+        # Link queue to webrtcbin sink pad
+        video_queue_src = video_queue.get_static_pad("src")
+        webrtc_video_sink = self._webrtc.get_request_pad("sink_%u")
+        if video_queue_src.link(webrtc_video_sink) != Gst.PadLinkReturn.OK:
+            print(f"[gst-{self.subscriber_id}] failed to link video queue to webrtcbin")
+            return
+
+        self._video_queue = video_queue
+
+        # Do the same for audio if available
+        if self._audio_tee:
+            audio_queue = Gst.ElementFactory.make(
+                "queue", f"audio_queue_{self.subscriber_id}"
+            )
+            self._source_pipeline.add(audio_queue)
+
+            self._audio_tee_src_pad = self._audio_tee.get_request_pad("src_%u")
+            audio_queue_sink = audio_queue.get_static_pad("sink")
+            if self._audio_tee_src_pad.link(audio_queue_sink) != Gst.PadLinkReturn.OK:
+                print(f"[gst-{self.subscriber_id}] failed to link audio tee to queue")
+                return
+
+            audio_queue_src = audio_queue.get_static_pad("src")
+            webrtc_audio_sink = self._webrtc.get_request_pad("sink_%u")
+            if audio_queue_src.link(webrtc_audio_sink) != Gst.PadLinkReturn.OK:
+                print(
+                    f"[gst-{self.subscriber_id}] failed to link audio queue to webrtcbin"
+                )
+                return
+
+            self._audio_queue = audio_queue
+
+        # Sync all elements
+        self._webrtc.sync_state_with_parent()
+        self._video_queue.sync_state_with_parent()
+        if self._audio_queue:
+            self._audio_queue.sync_state_with_parent()
+
+        # Note: Bus messages are handled by the main source pipeline
 
         # ICE candidates from GStreamer -> WS
         def on_ice_candidate(_webrtc, mlineindex, candidate):
@@ -196,17 +254,57 @@ class SubscriberConnection:
 
         self._webrtc.connect("on-negotiation-needed", on_negotiation_needed)
 
-        self._pipeline.set_state(Gst.State.PLAYING)
         # Immediately create offer for this subscriber
         create_offer()
 
     def stop(self) -> None:
-        """Stop and cleanup this subscriber's pipeline"""
+        """Stop and cleanup this subscriber's webrtcbin and tee connections"""
         try:
-            if self._pipeline:
-                self._pipeline.set_state(Gst.State.NULL)
+            if self._webrtc:
+                # Unlink pads
+                if self._video_queue:
+                    video_queue_src = self._video_queue.get_static_pad("src")
+                    if video_queue_src:
+                        peer = video_queue_src.get_peer()
+                        if peer:
+                            video_queue_src.unlink(peer)
+                            self._webrtc.release_request_pad(peer)
+
+                    if self._video_tee_src_pad:
+                        video_queue_sink = self._video_queue.get_static_pad("sink")
+                        if video_queue_sink:
+                            video_queue_sink.unlink(self._video_tee_src_pad)
+                            self._video_tee.release_request_pad(self._video_tee_src_pad)
+
+                if self._audio_queue and self._audio_tee_src_pad:
+                    audio_queue_src = self._audio_queue.get_static_pad("src")
+                    if audio_queue_src:
+                        peer = audio_queue_src.get_peer()
+                        if peer:
+                            audio_queue_src.unlink(peer)
+                            self._webrtc.release_request_pad(peer)
+
+                    audio_queue_sink = self._audio_queue.get_static_pad("sink")
+                    if audio_queue_sink:
+                        audio_queue_sink.unlink(self._audio_tee_src_pad)
+                        self._audio_tee.release_request_pad(self._audio_tee_src_pad)
+
+                # Set elements to NULL state
+                if self._video_queue:
+                    self._video_queue.set_state(Gst.State.NULL)
+                if self._audio_queue:
+                    self._audio_queue.set_state(Gst.State.NULL)
+                self._webrtc.set_state(Gst.State.NULL)
+
+                # Remove elements from pipeline
+                if self._video_queue:
+                    self._source_pipeline.remove(self._video_queue)
+                if self._audio_queue:
+                    self._source_pipeline.remove(self._audio_queue)
+                self._source_pipeline.remove(self._webrtc)
+
         except Exception as e:
-            print(f"[gst-{self.subscriber_id}] error stopping pipeline: {e}")
+            print(f"[gst-{self.subscriber_id}] error stopping connection: {e}")
 
     def handle_answer(self, msg: Dict[str, Any]) -> None:
         """Handle SDP answer from subscriber"""
@@ -250,7 +348,7 @@ class SubscriberConnection:
 
 class GstWebRTCPublisher:
     """
-    Manages multiple subscriber connections, each with its own pipeline.
+    Manages a single source pipeline with multiple subscriber connections via tee.
     """
 
     def __init__(
@@ -266,6 +364,9 @@ class GstWebRTCPublisher:
         self.audio_device = audio_device
 
         self._glib_loop: Optional[GLib.MainLoop] = None
+        self._source_pipeline: Optional[Gst.Pipeline] = None
+        self._video_tee: Optional[Gst.Element] = None
+        self._audio_tee: Optional[Gst.Element] = None
         self._ws = None
         self._aio_loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -274,7 +375,8 @@ class GstWebRTCPublisher:
 
     def start(self, aio_loop: asyncio.AbstractEventLoop, ws) -> None:
         """
-        Start GLib main loop thread. Subscriber pipelines are created on-demand.
+        Start GLib main loop thread and create the shared source pipeline.
+        Subscriber connections are added on-demand.
         """
         self._aio_loop = aio_loop
         self._ws = ws
@@ -283,15 +385,55 @@ class GstWebRTCPublisher:
         self._glib_loop = GLib.MainLoop()
         threading.Thread(target=self._glib_loop.run, daemon=True).start()
 
+        # Build and start the shared source pipeline
+        def _do():
+            self._source_pipeline, self._video_tee, self._audio_tee = (
+                build_source_pipeline(
+                    self.video_device,
+                    self.video_size,
+                    self.framerate,
+                    self.audio_device,
+                )
+            )
+
+            # Set up bus message handling
+            bus = self._source_pipeline.get_bus()
+            if bus:
+                bus.add_signal_watch()
+
+                def on_bus_message(_bus, message):
+                    t = message.type
+                    if t == Gst.MessageType.ERROR:
+                        err, dbg = message.parse_error()
+                        print("[gst-source] ERROR:", err, dbg)
+                    elif t == Gst.MessageType.WARNING:
+                        err, dbg = message.parse_warning()
+                        print("[gst-source] WARNING:", err, dbg)
+
+                bus.connect("message", on_bus_message)
+
+            self._source_pipeline.set_state(Gst.State.PLAYING)
+            print("[publisher] source pipeline started")
+            return False
+
+        GLib.idle_add(_do)
+
     def stop(self) -> None:
-        """Stop all subscriber connections and GLib loop"""
-        # Stop all subscriber pipelines
+        """Stop all subscriber connections, source pipeline, and GLib loop"""
+        # Stop all subscriber connections
         for sub in list(self._subscribers.values()):
             try:
                 sub.stop()
             except Exception:
                 pass
         self._subscribers.clear()
+
+        # Stop source pipeline
+        if self._source_pipeline:
+            try:
+                self._source_pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
 
         # Stop GLib loop
         if self._glib_loop:
@@ -301,23 +443,34 @@ class GstWebRTCPublisher:
                 pass
 
     def create_subscriber_connection(self, subscriber_id: str) -> None:
-        """Create a new pipeline for a subscriber"""
+        """Create a new webrtcbin connection for a subscriber"""
         if subscriber_id in self._subscribers:
             print(f"[publisher] subscriber {subscriber_id} already exists")
+            return
+
+        if not self._source_pipeline or not self._video_tee:
+            print(
+                f"[publisher] source pipeline not ready, cannot create connection for {subscriber_id}"
+            )
             return
 
         print(f"[publisher] creating connection for subscriber {subscriber_id}")
         sub = SubscriberConnection(
             subscriber_id=subscriber_id,
-            video_device=self.video_device,
-            video_size=self.video_size,
-            framerate=self.framerate,
-            audio_device=self.audio_device,
+            source_pipeline=self._source_pipeline,
+            video_tee=self._video_tee,
+            audio_tee=self._audio_tee,
             aio_loop=self._aio_loop,
             ws=self._ws,
         )
         self._subscribers[subscriber_id] = sub
-        sub.start()
+
+        # Start connection on GLib thread
+        def _do():
+            sub.start()
+            return False
+
+        GLib.idle_add(_do)
 
     def remove_subscriber_connection(self, subscriber_id: str) -> None:
         """Remove a subscriber's connection"""
