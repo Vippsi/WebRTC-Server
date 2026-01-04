@@ -1,26 +1,89 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <title>WebRTC Subscriber</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Subscriber</title>
     <style>
-      body { font-family: sans-serif; margin: 16px; }
-      video { width: 100%; max-width: 900px; background: #111; }
-      button { margin-right: 8px; }
+      body { margin: 0; background: #000; }
+      #v { width: 100vw; height: 100vh; object-fit: contain; }
+      #log {
+        position: fixed; left: 8px; bottom: 8px; right: 8px;
+        max-height: 35vh; overflow: auto;
+        background: rgba(0,0,0,.6); color: #0f0;
+        font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        padding: 8px; border-radius: 10px; white-space: pre-wrap;
+      }
     </style>
   </head>
+
   <body>
-    <h1>Subscriber</h1>
-    <video id="v" autoplay playsinline controls></video>
-
-    <div style="margin-top:12px;">
-      <button id="tap">Send Tap (100,100)</button>
-      <button id="text">Send Text "hello"</button>
-      <button id="enter">Send ENTER</button>
-    </div>
-
+    <video id="v" autoplay muted playsinline></video>
     <pre id="log"></pre>
 
-    <script type="module" src="./src/subscriber.ts"></script>
+    <script type="module">
+      import { log } from "/src/utils.ts";
+      import { makePC, addIceToPC } from "/src/webrtc.ts";
+      import { createWebSocket } from "/src/websocket.ts";
+      import { setupKeyboardControl } from "/src/control.ts";
+
+      // URL pattern: http://localhost:5173/?ws=ws://192.168.50.107:8080
+      const wsUrl =
+        new URLSearchParams(location.search).get("ws") || "ws://192.168.50.107:8080";
+
+      let pc = /** @type {RTCPeerConnection | null} */ (null);
+      let remoteDescriptionSet = false;
+      /** @type {unknown[]} */
+      const pendingCandidates = [];
+
+      function getPC() { return pc; }
+      function getRemoteDescriptionSet() { return remoteDescriptionSet; }
+
+      function addPendingCandidate(candidate) {
+        pendingCandidates.push(candidate);
+      }
+
+      async function drainPendingCandidates() {
+        if (!pc || !remoteDescriptionSet) return;
+        while (pendingCandidates.length) {
+          const c = pendingCandidates.shift();
+          await addIceToPC(pc, c);
+        }
+      }
+
+      async function onOffer(sdp) {
+        log("got offer");
+
+        // Recreate PC per offer to avoid stale DTLS/transceivers (matches your earlier approach)
+        try { pc?.close(); } catch {}
+        pc = makePC(ws);
+        remoteDescriptionSet = false;
+
+        await pc.setRemoteDescription(sdp);
+        remoteDescriptionSet = true;
+
+        await drainPendingCandidates();
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription }));
+        log("sent answer");
+      }
+
+      const ws = createWebSocket(
+        wsUrl,
+        onOffer,
+        drainPendingCandidates,
+        getPC,
+        getRemoteDescriptionSet,
+        addPendingCandidate
+      );
+
+      // keyboard controls over WS -> signaling -> publisher
+      setupKeyboardControl(ws);
+
+      log("viewer ready:", wsUrl);
+    </script>
   </body>
 </html>
