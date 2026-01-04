@@ -1,12 +1,20 @@
 // subscriber/src/websocket.ts
 
 import { log } from './utils';
-import type { IncomingMsg, HelloMsg, OfferMsg, CandidateMsg } from './types';
+import type {
+  IncomingMsg,
+  HelloMsg,
+  HelloAckMsg,
+  OfferMsg,
+  CandidateMsg,
+  ViewerReadyMsg,
+} from './types';
 
 // Declare Window.ws for DevTools access
 declare global {
   interface Window {
     ws?: WebSocket;
+    subscriberId?: string;
   }
 }
 
@@ -16,7 +24,9 @@ export function createWebSocket(
   drainPendingCandidates: () => Promise<void>,
   getPC: () => RTCPeerConnection | null,
   getRemoteDescriptionSet: () => boolean,
-  addPendingCandidate: (candidate: unknown) => void
+  addPendingCandidate: (candidate: unknown) => void,
+  getSubscriberId: () => string | undefined,
+  setSubscriberId: (id: string) => void
 ): WebSocket {
   const ws = new WebSocket(url);
   window.ws = ws;
@@ -49,8 +59,19 @@ export function createWebSocket(
       return;
     }
 
-    if (msg.type === 'hello' || msg.type === 'hello-ack') {
-      log('hello ack');
+    if (msg.type === 'hello') {
+      const helloAck = msg as HelloAckMsg;
+      if (helloAck.ok && helloAck.subscriberId) {
+        setSubscriberId(helloAck.subscriberId);
+        log(`hello ack, subscriberId: ${helloAck.subscriberId}`);
+
+        // Send viewer-ready to trigger offer creation
+        const viewerReady: ViewerReadyMsg = { type: 'viewer-ready' };
+        ws.send(JSON.stringify(viewerReady));
+        log('sent viewer-ready');
+      } else {
+        log('hello ack (no subscriberId)');
+      }
       return;
     }
 

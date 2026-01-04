@@ -78,46 +78,36 @@ def build_pipeline(
     return Gst.parse_launch(desc)
 
 
-class GstWebRTCPublisher:
+class SubscriberConnection:
     """
-    Owns the GStreamer pipeline and translates between:
-      - GStreamer webrtcbin callbacks (offer, ICE)
-      - WS signaling messages (answer, ICE)
+    Manages a single subscriber's WebRTC connection (pipeline + webrtcbin)
     """
 
     def __init__(
         self,
+        subscriber_id: str,
         video_device: str,
         video_size: str,
         framerate: int,
         audio_device: Optional[str],
+        aio_loop: asyncio.AbstractEventLoop,
+        ws,
     ) -> None:
+        self.subscriber_id = subscriber_id
         self.video_device = video_device
         self.video_size = video_size
         self.framerate = framerate
         self.audio_device = audio_device
-
-        self._glib_loop: Optional[GLib.MainLoop] = None
-        self._pipeline: Optional[Gst.Pipeline] = None
-        self._webrtc: Optional[Gst.Element] = None
-
-        self._ws = None
-        self._aio_loop: Optional[asyncio.AbstractEventLoop] = None
-
-        self._making_offer = False
-        self._have_remote_answer = False
-
-    def start(self, aio_loop: asyncio.AbstractEventLoop, ws) -> None:
-        """
-        Start GLib main loop thread + pipeline PLAYING, and wire callbacks to the given WS.
-        """
         self._aio_loop = aio_loop
         self._ws = ws
 
-        # Run GLib loop in background thread
-        self._glib_loop = GLib.MainLoop()
-        threading.Thread(target=self._glib_loop.run, daemon=True).start()
+        self._pipeline: Optional[Gst.Pipeline] = None
+        self._webrtc: Optional[Gst.Element] = None
+        self._making_offer = False
+        self._have_remote_answer = False
 
+    def start(self) -> None:
+        """Start the pipeline for this subscriber"""
         # Build + start pipeline
         self._pipeline = build_pipeline(
             self.video_device, self.video_size, self.framerate, self.audio_device
@@ -126,7 +116,7 @@ class GstWebRTCPublisher:
         assert webrtc is not None
         self._webrtc = webrtc
 
-        # Drain bus + log errors/warnings (prevents bus queue overflow)
+        # Drain bus + log errors/warnings
         bus = self._pipeline.get_bus()
         if bus:
             bus.add_signal_watch()
@@ -135,10 +125,10 @@ class GstWebRTCPublisher:
                 t = message.type
                 if t == Gst.MessageType.ERROR:
                     err, dbg = message.parse_error()
-                    print("[gst] ERROR:", err, dbg)
+                    print(f"[gst-{self.subscriber_id}] ERROR:", err, dbg)
                 elif t == Gst.MessageType.WARNING:
                     err, dbg = message.parse_warning()
-                    print("[gst] WARNING:", err, dbg)
+                    print(f"[gst-{self.subscriber_id}] WARNING:", err, dbg)
 
             bus.connect("message", on_bus_message)
 
@@ -146,6 +136,7 @@ class GstWebRTCPublisher:
         def on_ice_candidate(_webrtc, mlineindex, candidate):
             msg = {
                 "type": "candidate",
+                "subscriberId": self.subscriber_id,
                 "candidate": {
                     "candidate": candidate,
                     "sdpMLineIndex": int(mlineindex),
@@ -162,13 +153,15 @@ class GstWebRTCPublisher:
             try:
                 promise.wait()
                 reply = promise.get_reply()
-                offer = reply.get_value("offer")  # GstWebRTCSessionDescription
+                offer = reply.get_value("offer")
                 if offer is None:
                     try:
                         txt = reply.to_string()
                     except Exception:
                         txt = None
-                    print("[gst] offer is None; promise reply:", txt)
+                    print(
+                        f"[gst-{self.subscriber_id}] offer is None; promise reply:", txt
+                    )
                     self._making_offer = False
                     return
 
@@ -176,18 +169,20 @@ class GstWebRTCPublisher:
                 self._webrtc.emit("set-local-description", offer, Gst.Promise.new())
 
                 sdp_text = offer.sdp.as_text()
-                msg = {"type": "offer", "sdp": {"type": "offer", "sdp": sdp_text}}
+                msg = {
+                    "type": "offer",
+                    "subscriberId": self.subscriber_id,
+                    "sdp": {"type": "offer", "sdp": sdp_text},
+                }
 
                 loop = self._aio_loop
                 if loop:
                     asyncio.run_coroutine_threadsafe(self._ws.send(jdump(msg)), loop)
-                print("[gst] sent offer")
+                print(f"[gst-{self.subscriber_id}] sent offer")
             finally:
-                # allow future renegotiation if needed
                 self._making_offer = False
 
         def create_offer():
-            # guard against repeated offers from noisy negotiation-needed
             if self._making_offer:
                 return
             self._making_offer = True
@@ -196,89 +191,31 @@ class GstWebRTCPublisher:
 
         # Negotiation-needed from GStreamer
         def on_negotiation_needed(_webrtc):
-            print("[gst] on-negotiation-needed")
+            print(f"[gst-{self.subscriber_id}] on-negotiation-needed")
             create_offer()
 
         self._webrtc.connect("on-negotiation-needed", on_negotiation_needed)
 
         self._pipeline.set_state(Gst.State.PLAYING)
-
-        # If subscriber comes later, we can re-offer when we see a peer event.
-        # (No offer here yet; negotiation-needed will usually fire quickly anyway.)
+        # Immediately create offer for this subscriber
+        create_offer()
 
     def stop(self) -> None:
+        """Stop and cleanup this subscriber's pipeline"""
         try:
             if self._pipeline:
                 self._pipeline.set_state(Gst.State.NULL)
-        finally:
-            if self._glib_loop:
-                try:
-                    self._glib_loop.quit()
-                except Exception:
-                    pass
-
-    def on_peer_connected(self, role: str) -> None:
-        # When subscriber connects, ensure we (re)offer so start order doesn't matter.
-        if role != "subscriber":
-            return
-        if not self._webrtc:
-            return
-        print("[gst] peer connected subscriber -> ensure offer")
-
-        # Create-offer must be called on the GLib/GStreamer thread context.
-        # We can schedule it using GLib.idle_add safely.
-        def _do():
-            # reset remote-answer marker, allow new offer
-            self._have_remote_answer = False
-            # trigger offer explicitly
-            if not self._making_offer:
-                self._making_offer = True
-                promise = Gst.Promise.new_with_change_func(
-                    # reuse the same callback used in start()
-                    lambda p,
-                    u: None,  # placeholder (we'll call create-offer via emit below)
-                    None,
-                )
-
-            # Better: just emit create-offer and let existing on_offer_created handle it
-            # BUT on_offer_created closure is inside start(). So instead, we just poke negotiation.
-            # Easiest reliable approach: call "emit('create-offer')" again with a fresh promise+callback.
-            def on_offer_created_local(promise, _):
-                try:
-                    promise.wait()
-                    reply = promise.get_reply()
-                    offer = reply.get_value("offer")
-                    if offer is None:
-                        self._making_offer = False
-                        return
-                    self._webrtc.emit("set-local-description", offer, Gst.Promise.new())
-                    sdp_text = offer.sdp.as_text()
-                    msg = {"type": "offer", "sdp": {"type": "offer", "sdp": sdp_text}}
-                    loop = self._aio_loop
-                    if loop:
-                        asyncio.run_coroutine_threadsafe(
-                            self._ws.send(jdump(msg)), loop
-                        )
-                    print("[gst] sent offer (peer-connect)")
-                finally:
-                    self._making_offer = False
-
-            if self._making_offer:
-                return
-            self._making_offer = True
-            promise = Gst.Promise.new_with_change_func(on_offer_created_local, None)
-            self._webrtc.emit("create-offer", None, promise)
-            return False  # remove idle handler
-
-        GLib.idle_add(_do)
+        except Exception as e:
+            print(f"[gst-{self.subscriber_id}] error stopping pipeline: {e}")
 
     def handle_answer(self, msg: Dict[str, Any]) -> None:
+        """Handle SDP answer from subscriber"""
         if not self._webrtc:
             return
         sdp_obj = msg.get("sdp") or {}
         sdp_text = sdp_obj.get("sdp")
         if not sdp_text:
-            print("[gst] answer missing sdp")
+            print(f"[gst-{self.subscriber_id}] answer missing sdp")
             return
 
         sdpmsg = sdp_from_text(sdp_text)
@@ -289,12 +226,13 @@ class GstWebRTCPublisher:
         def _do():
             self._webrtc.emit("set-remote-description", answer, Gst.Promise.new())
             self._have_remote_answer = True
-            print("[gst] set remote description (answer)")
+            print(f"[gst-{self.subscriber_id}] set remote description (answer)")
             return False
 
         GLib.idle_add(_do)
 
     def handle_candidate(self, msg: Dict[str, Any]) -> None:
+        """Handle ICE candidate from subscriber"""
         if not self._webrtc:
             return
         c = msg.get("candidate") or {}
@@ -308,6 +246,116 @@ class GstWebRTCPublisher:
             return False
 
         GLib.idle_add(_do)
+
+
+class GstWebRTCPublisher:
+    """
+    Manages multiple subscriber connections, each with its own pipeline.
+    """
+
+    def __init__(
+        self,
+        video_device: str,
+        video_size: str,
+        framerate: int,
+        audio_device: Optional[str],
+    ) -> None:
+        self.video_device = video_device
+        self.video_size = video_size
+        self.framerate = framerate
+        self.audio_device = audio_device
+
+        self._glib_loop: Optional[GLib.MainLoop] = None
+        self._ws = None
+        self._aio_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Map subscriber_id -> SubscriberConnection
+        self._subscribers: Dict[str, SubscriberConnection] = {}
+
+    def start(self, aio_loop: asyncio.AbstractEventLoop, ws) -> None:
+        """
+        Start GLib main loop thread. Subscriber pipelines are created on-demand.
+        """
+        self._aio_loop = aio_loop
+        self._ws = ws
+
+        # Run GLib loop in background thread
+        self._glib_loop = GLib.MainLoop()
+        threading.Thread(target=self._glib_loop.run, daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop all subscriber connections and GLib loop"""
+        # Stop all subscriber pipelines
+        for sub in list(self._subscribers.values()):
+            try:
+                sub.stop()
+            except Exception:
+                pass
+        self._subscribers.clear()
+
+        # Stop GLib loop
+        if self._glib_loop:
+            try:
+                self._glib_loop.quit()
+            except Exception:
+                pass
+
+    def create_subscriber_connection(self, subscriber_id: str) -> None:
+        """Create a new pipeline for a subscriber"""
+        if subscriber_id in self._subscribers:
+            print(f"[publisher] subscriber {subscriber_id} already exists")
+            return
+
+        print(f"[publisher] creating connection for subscriber {subscriber_id}")
+        sub = SubscriberConnection(
+            subscriber_id=subscriber_id,
+            video_device=self.video_device,
+            video_size=self.video_size,
+            framerate=self.framerate,
+            audio_device=self.audio_device,
+            aio_loop=self._aio_loop,
+            ws=self._ws,
+        )
+        self._subscribers[subscriber_id] = sub
+        sub.start()
+
+    def remove_subscriber_connection(self, subscriber_id: str) -> None:
+        """Remove a subscriber's connection"""
+        sub = self._subscribers.pop(subscriber_id, None)
+        if sub:
+            print(f"[publisher] removing connection for subscriber {subscriber_id}")
+            try:
+                sub.stop()
+            except Exception:
+                pass
+
+    def handle_answer(self, msg: Dict[str, Any]) -> None:
+        """Route answer to the correct subscriber"""
+        subscriber_id = msg.get("subscriberId")
+        if not subscriber_id:
+            print("[publisher] answer missing subscriberId")
+            return
+
+        sub = self._subscribers.get(subscriber_id)
+        if not sub:
+            print(f"[publisher] answer for unknown subscriber {subscriber_id}")
+            return
+
+        sub.handle_answer(msg)
+
+    def handle_candidate(self, msg: Dict[str, Any]) -> None:
+        """Route ICE candidate to the correct subscriber"""
+        subscriber_id = msg.get("subscriberId")
+        if not subscriber_id:
+            print("[publisher] candidate missing subscriberId")
+            return
+
+        sub = self._subscribers.get(subscriber_id)
+        if not sub:
+            print(f"[publisher] candidate for unknown subscriber {subscriber_id}")
+            return
+
+        sub.handle_candidate(msg)
 
 
 async def handle_control(roku: RokuECP, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -379,11 +427,35 @@ async def publisher_loop(args: argparse.Namespace) -> None:
 
                     if mtype == "peer":
                         # signaling server notifies connection events
-                        # {type:"peer", event:"connected"|"disconnected", role:"subscriber"|...}
+                        # {type:"peer", event:"connected"|"disconnected", role:"subscriber"|..., subscriberId?:string}
                         event = msg.get("event")
                         role = msg.get("role")
-                        if event == "connected" and isinstance(role, str) and gst_pub:
-                            gst_pub.on_peer_connected(role)
+                        subscriber_id = msg.get("subscriberId")
+
+                        if (
+                            event == "connected"
+                            and role == "subscriber"
+                            and subscriber_id
+                            and gst_pub
+                        ):
+                            # Subscriber connected - wait for viewer-ready message to create connection
+                            print(f"[publisher] subscriber {subscriber_id} connected")
+                        elif (
+                            event == "disconnected"
+                            and role == "subscriber"
+                            and subscriber_id
+                            and gst_pub
+                        ):
+                            # Subscriber disconnected - cleanup
+                            gst_pub.remove_subscriber_connection(subscriber_id)
+                        continue
+
+                    if mtype == "viewer-ready":
+                        # Subscriber is ready - create a new connection for them
+                        subscriber_id = msg.get("subscriberId")
+                        if subscriber_id and gst_pub:
+                            print(f"[publisher] viewer-ready from {subscriber_id}")
+                            gst_pub.create_subscriber_connection(subscriber_id)
                         continue
 
                     # --- WebRTC signaling (answer / candidate) ---

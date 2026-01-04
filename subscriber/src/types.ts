@@ -3,13 +3,32 @@
 export type Role = 'publisher' | 'subscriber';
 
 export type HelloMsg = { type: 'hello'; role: Role };
-export type OfferMsg = { type: 'offer'; sdp: RTCSessionDescriptionInit };
-export type AnswerMsg = { type: 'answer'; sdp: RTCSessionDescriptionInit };
-export type CandidateMsg = { type: 'candidate'; candidate: unknown };
+export type HelloAckMsg = {
+  type: 'hello';
+  ok?: boolean;
+  role?: Role;
+  subscriberId?: string;
+};
+export type OfferMsg = {
+  type: 'offer';
+  sdp: RTCSessionDescriptionInit;
+  subscriberId?: string;
+};
+export type AnswerMsg = {
+  type: 'answer';
+  sdp: RTCSessionDescriptionInit;
+  subscriberId?: string;
+};
+export type CandidateMsg = {
+  type: 'candidate';
+  candidate: unknown;
+  subscriberId?: string;
+};
 export type ControlStatusMsg = { type: 'control-status'; payload: unknown };
+export type ViewerReadyMsg = { type: 'viewer-ready' };
 
 export type IncomingMsg =
-  | { type: 'hello' | 'hello-ack'; ok?: boolean }
+  | HelloAckMsg
   | OfferMsg
   | CandidateMsg
   | ControlStatusMsg

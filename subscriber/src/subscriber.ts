@@ -9,6 +9,7 @@ import type { AnswerMsg } from './types';
 // ---- state ----
 let pc: RTCPeerConnection | null = null;
 let remoteDescriptionSet = false;
+let subscriberId: string | undefined = undefined;
 let offerCount = 0;
 
 // IMPORTANT: keep this across offer until applied
@@ -17,9 +18,7 @@ let pendingCandidates: unknown[] = [];
 // ---- WebSocket URL ----
 const wsParam = new URLSearchParams(location.search).get('ws');
 const WS_URL =
-  (location.protocol === "https:" ? "wss://" : "ws://") +
-  location.host +
-  "/ws";
+  (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
 
 log('WS_URL =', WS_URL);
 
@@ -46,9 +45,27 @@ const ws = createWebSocket(
       pendingCandidates = [];
     }
 
+    if (!pc) {
+      log('failed to create/get PC');
+      return;
+    }
+
+    // Always override onicecandidate to include subscriberId (for both new and reused PCs)
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        ws.send(
+          JSON.stringify({
+            type: 'candidate',
+            subscriberId: subscriberId,
+            candidate: ev.candidate.toJSON(),
+          })
+        );
+      }
+    };
+
     remoteDescriptionSet = false;
 
-    const thisPC = pc!;
+    const thisPC = pc;
 
     await thisPC.setRemoteDescription(sdp);
     remoteDescriptionSet = true;
@@ -67,7 +84,7 @@ const ws = createWebSocket(
       return;
     }
 
-    const out: AnswerMsg = { type: 'answer', sdp: desc };
+    const out: AnswerMsg = { type: 'answer', subscriberId, sdp: desc };
     ws.send(JSON.stringify(out));
     log('sent answer');
   },
@@ -83,6 +100,10 @@ const ws = createWebSocket(
   () => remoteDescriptionSet,
   (candidate) => {
     pendingCandidates.push(candidate);
+  },
+  () => subscriberId,
+  (id: string) => {
+    subscriberId = id;
   }
 );
 

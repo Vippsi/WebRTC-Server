@@ -38,7 +38,7 @@
 
     <script type="module">
       import { log } from '/src/utils.ts';
-      import { makePC, addIceToPC } from '/src/webrtc.ts';
+      import { makePC as originalMakePC, addIceToPC } from '/src/webrtc.ts';
       import { createWebSocket } from '/src/websocket.ts';
       import { setupKeyboardControl } from '/src/control.ts';
 
@@ -49,6 +49,7 @@
 
       let pc = /** @type {RTCPeerConnection | null} */ (null);
       let remoteDescriptionSet = false;
+      let subscriberId = /** @type {string | undefined} */ (undefined);
       /** @type {unknown[]} */
       const pendingCandidates = [];
 
@@ -57,6 +58,13 @@
       }
       function getRemoteDescriptionSet() {
         return remoteDescriptionSet;
+      }
+      function getSubscriberId() {
+        return subscriberId;
+      }
+      function setSubscriberId(id) {
+        subscriberId = id;
+        window.subscriberId = id;
       }
 
       function addPendingCandidate(candidate) {
@@ -69,6 +77,24 @@
           const c = pendingCandidates.shift();
           await addIceToPC(pc, c);
         }
+      }
+
+      // Override makePC to include subscriberId in candidate messages
+      function makePC(socket) {
+        const pc = originalMakePC(socket);
+        const originalOnIceCandidate = pc.onicecandidate;
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) {
+            socket.send(
+              JSON.stringify({
+                type: 'candidate',
+                subscriberId: subscriberId,
+                candidate: ev.candidate.toJSON(),
+              })
+            );
+          }
+        };
+        return pc;
       }
 
       async function onOffer(sdp) {
@@ -89,7 +115,12 @@
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
-        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription }));
+        const answerMsg = {
+          type: 'answer',
+          subscriberId: subscriberId,
+          sdp: pc.localDescription,
+        };
+        ws.send(JSON.stringify(answerMsg));
         log('sent answer');
       }
 
@@ -99,7 +130,9 @@
         drainPendingCandidates,
         getPC,
         getRemoteDescriptionSet,
-        addPendingCandidate
+        addPendingCandidate,
+        getSubscriberId,
+        setSubscriberId
       );
 
       // keyboard controls over WS -> signaling -> publisher
