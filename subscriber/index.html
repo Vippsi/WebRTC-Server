@@ -45,7 +45,7 @@
       const wsUrl =
         (location.protocol === 'https:' ? 'wss://' : 'ws://') +
         location.host +
-        '/'; // or "/ws" if your backend expects a path
+        '/ws';
 
       let pc = /** @type {RTCPeerConnection | null} */ (null);
       let remoteDescriptionSet = false;
