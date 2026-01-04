@@ -50,7 +50,7 @@ def build_source_pipeline(
     """
     w, h = video_size.split("x")
 
-    # Build video source -> tee
+    # Build video source -> tee -> fakesink (fakesink allows pipeline to start without subscribers)
     video_desc = f"""
       v4l2src device={video_dev} !
         image/jpeg,width={w},height={h},framerate={fps}/1 !
@@ -63,6 +63,7 @@ def build_source_pipeline(
         rtph264pay config-interval=1 pt=96 !
         application/x-rtp,media=video,encoding-name=H264,payload=96 !
         tee name=video_tee
+          video_tee. ! queue ! fakesink
     """
 
     audio_tee = None
@@ -75,6 +76,7 @@ def build_source_pipeline(
             rtpopuspay pt=111 !
             application/x-rtp,media=audio,encoding-name=OPUS,payload=111 !
             tee name=audio_tee
+              audio_tee. ! queue ! fakesink
         """
         desc = video_desc + "\n      " + audio_desc
     else:
