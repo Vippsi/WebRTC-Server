@@ -1,0 +1,5 @@
+{
+  "venvPath": "publisher",
+  "venv": ".venv",
+  "executionEnvironments": [{ "root": "publisher" }],
+}

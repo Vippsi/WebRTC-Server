@@ -1,11 +1,9 @@
-/// <reference types="vite/client" />
 // subscriber/src/webrtc.ts
 
 import { getVideo, log, normalizeIce } from './utils';
-import type { CandidateMsg } from './types';
 
-const turnUsername = import.meta.env.VITE_TURN_USERNAME ?? 'webrtcuser';
-const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL ?? 'REPLACE_WITH_STRONG_PASSWORD';
+const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
 
 export async function addIceToPC(
   targetPC: RTCPeerConnection,
@@ -46,7 +44,7 @@ export function makePC(socket: WebSocket): RTCPeerConnection {
       vid.srcObject = stream;
 
       // kick play for Safari/Chrome autoplay policies
-      void vid.play().catch(() => {});
+      void vid.play().catch(() => { });
     }
     log('track:', ev.track.kind);
   };
